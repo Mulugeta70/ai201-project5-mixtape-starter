@@ -100,3 +100,47 @@ This confirms the condition `elif days_since_last == 1 and today.weekday() != 6`
 
 - After reproduction, re-ran `python seed_data.py` to reset the dev DB to a clean seeded state before starting fix work, since the Issue #4 repro step wrote a real `Rating` row to `mixtape.db`.
 - No code changes were made in this milestone.
+
+---
+
+## Milestone 3: Root Cause Analysis and Fixes
+
+### Issue #1 — Listening streak keeps resetting
+
+**How I reproduced it:** See Milestone 2. Called `update_listening_streak()` directly with a Saturday (`weekday()==5`) then a Sunday (`weekday()==6`) datetime, one calendar day apart — streak stayed at 1 instead of incrementing to 2.
+
+**How I found the root cause:** Started at `services/streak_service.py::update_listening_streak()`, the only place `listening_streak` is mutated (confirmed via the function's own docstring, which is called from `record_listening_event()`, which is called from `POST /songs/<id>/listen` in `routes/songs.py`). The docstring lists exactly three cases: same day → no change, one day later → increment, more than one day → reset. Reading the `if`/`elif`/`else` directly under that docstring, the `elif` branch read `days_since_last == 1 and today.weekday() != 6` — a second condition on `today.weekday()` that isn't mentioned anywhere in the documented rules. That mismatch between the stated contract (three date-gap cases) and the actual code (a fourth, undocumented weekday condition) was the moment I was confident this was the exact cause, not just a suspicious area — the condition has no reason to exist given the function's own spec, and it's an exact match for the reported symptom ("keeps resetting" — specifically on Sundays).
+
+**The root cause:** `days_since_last == 1` correctly detects a consecutive-day listen, but the code additionally required `today.weekday() != 6` (i.e., the *current* day must not be Sunday) before it would increment the streak. `datetime.weekday()` returns `6` for Sunday. So whenever a user's consecutive listen happened to land on a Sunday, the `elif` condition evaluated to `False` even though the day gap was exactly 1, and execution fell through to the `else` branch, which unconditionally resets the streak to 1. The bug wasn't in the date-gap arithmetic (that part was correct) — it was an extra, spec-contradicting condition bolted onto the correct branch.
+
+**Fix and side-effect check:** Removed the `and today.weekday() != 6` clause, leaving `elif days_since_last == 1:` to match the function's own documented contract exactly. Ran `tests/test_streaks.py` — all 5 tests pass, including the previously-failing `test_streak_increments_on_sunday`. Checked both sides of the boundary manually with a scratch script: (a) Saturday → Sunday → Monday, all consecutive, correctly reaches streak 3; (b) Saturday → Monday (skipping Sunday) still correctly resets to 1 — confirming the fix only removed the erroneous weekday check and didn't disturb the still-correct "skip a day → reset" behavior. Ran the full suite (`pytest tests/`) — no other tests affected.
+
+**Commit:** `fix: remove erroneous Sunday check from streak increment logic`
+
+---
+
+### Issue #4 — Rating a song doesn't notify the sharer
+
+**How I reproduced it:** See Milestone 2. Via the live app: `darius` rated nova's seeded song "Midnight Drive" through `POST /songs/<id>/rate` (201, `Rating` created), but `GET /users/<nova_id>/notifications` showed no new notification, staying at the same count as before the rating.
+
+**How I found the root cause:** Started at `routes/songs.py::rate()`, which calls `notification_service.rate_song()` — despite living in `notification_service.py`, the function only validates the score, looks up the song/user, and upserts a `Rating` row; it never calls `create_notification()`. To confirm this was really the gap (and not, say, a missing route or a filter hiding the notification), I compared it directly against `add_to_playlist()` in the same file, which handles the *working* case from the issue description ("notified when a friend added my song to a playlist"). `add_to_playlist()` does the playlist-membership update, then explicitly checks `if song.shared_by != added_by_user_id` and calls `create_notification(...)`. `rate_song()` has the equivalent data available (`song.shared_by`, the rater, the score) but has no analogous block after its `db.session.commit()`. That side-by-side comparison — one function in the "notification service" file that notifies, and a structurally identical one that doesn't — is what confirmed the root cause precisely, rather than just "notifications are broken somewhere."
+
+**The root cause:** `rate_song()` never calls `create_notification()`. The notification-creation step that exists in `add_to_playlist()` (checking `song.shared_by != <actor>` and writing a `Notification` row) was simply never added to the rating code path, even though both actions live in the same file and both are exactly the kind of "friend interacted with your shared song" event the module's own docstring says it handles ("Notifications are generated when friends interact with a user's shared songs").
+
+**Fix and side-effect check:** Added a notification block to `rate_song()`, mirroring the existing pattern in `add_to_playlist()`: after the rating is committed, if `song.shared_by != user_id` (i.e., the rater isn't the song's own sharer), call `create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score}/5.")`. Verified via the live app: re-ran the exact reproduction sequence from Milestone 2 — `darius` rates nova's song — and `GET /users/<nova_id>/notifications` now shows a new `song_rated` notification alongside the existing `song_added_to_playlist` one. Checked side effects: re-rated the same song with a different score (upsert path, `existing.score = score`) to confirm the notification still fires correctly on updates, not just first-time ratings, since `rate_song()` doesn't distinguish insert vs. update before this fix either. Also confirmed a user rating their *own* shared song produces no notification (matches the `song.shared_by != user_id` guard, same as `add_to_playlist`'s guard). Ran the full test suite — no existing tests cover this path, so nothing regressed, and no test currently asserts the new behavior (noted as a gap; the three original test files don't cover `notification_service.py`).
+
+**Commit:** `fix: notify song sharer when a friend rates their song`
+
+---
+
+### Issue #5 — The last song in a playlist never shows up
+
+**How I reproduced it:** See Milestone 2. DB had 7 rows in `playlist_entries` for the seeded "Late Night Vibes" playlist (positions 1–7), but `GET /playlists/<id>/songs` returned only 6 songs, silently dropping the one at position 7.
+
+**How I found the root cause:** Started at `routes/playlists.py::get_songs()` → `playlist_service.get_playlist_songs()`. Read the query top-down: it joins `Song` to `playlist_entries` on `playlist_id`, filters correctly, and orders by `asc(playlist_entries.c.position)` — the ordering and filtering logic is correct, confirmed by comparing the query against the `playlist_entries` schema in `models.py`. The moment I was confident I'd found the exact cause (not just "somewhere in this function") was the final line: `return [song.to_dict() for song in songs[:-1]]`. The query variable `songs` is the correctly-ordered, correctly-filtered full result set — `songs[:-1]` is a Python slice that unconditionally drops the last element before it's ever serialized. There is no filtering condition, no `LIMIT` in the SQL, and no comment explaining an intentional exclusion — it's a bare off-by-one slice applied after the correct data was already fetched.
+
+**The root cause:** `get_playlist_songs()` builds the fully correct, position-ordered list of songs (`songs`), but then serializes `songs[:-1]` instead of `songs`, discarding the last song in the list every time, regardless of playlist size (a playlist with 1 song returns 0). This directly contradicts the function's own docstring one line above it: "This function returns all songs in the playlist."
+
+**Fix and side-effect check:** Changed `songs[:-1]` to `songs` so the full ordered result set is serialized. Ran `tests/test_playlists.py` — all 3 tests pass, including the two previously-failing ones (`test_playlist_returns_all_songs`, `test_playlist_returns_songs_in_order`). Checked the boundary explicitly: `test_empty_playlist_returns_empty_list` (0 songs) still passes — confirming the fix doesn't introduce an index error on empty playlists (a plain `songs` with no slicing handles the empty-list case naturally, whereas `songs[:-1]` on an empty list is also safe, but a length-1 playlist under the old code returned `[]` instead of the one song — verified this manually against a fresh 1-song playlist and confirmed it now returns exactly 1 song). Verified live via the app: re-ran the exact reproduction from Milestone 2 against "Late Night Vibes" — `GET /playlists/<id>/songs` now returns `count: 7`, including the previously-missing song at position 7. Checked related functionality: `get_playlist()` (metadata-only) and `get_user_playlists()` don't touch song lists, so they're unaffected. Ran the full test suite — no other tests affected.
+
+**Commit:** `fix: return all songs in playlist instead of dropping the last one`
