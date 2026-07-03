@@ -62,3 +62,41 @@ Every route is a thin wrapper: parse input → call one service function → ser
 ### Rough plan for which three to fix first
 
 Issues **#1**, **#4**, and **#5** already have clear, single-root-cause fixes confirmed by reading the code (and, for #1 and #5, by failing tests). Issue **#3** needs more investigation before I can be confident about the actual fix in this SQLAlchemy version, and issue **#2** needs a clearer read of what "yesterday" means for the reporting user before changing the recency window. I'll start with #1, #4, #5, then revisit #2 and #3 if time allows.
+
+---
+
+## Milestone 2: Bug Reproduction
+
+Reproduced each of the three chosen bugs before writing any fix code. No code was changed in this milestone — only reproduction scripts/requests run against the seeded dev DB and a scratch in-memory DB.
+
+### Issue #1 — Listening streak resets on Sunday
+
+**How I reproduced it:** Today's real date (2026-07-03) is a Friday, so the buggy `today.weekday() != 6` branch can't be hit through the live app's wall-clock `datetime.now()`. Instead I called the actual service function, `update_listening_streak()` (the same function `record_listening_event` calls from the live `/songs/<id>/listen` route), directly against a fresh in-memory DB, supplying two controlled UTC datetimes: Saturday 2026-07-04 12:00 (`weekday() == 5`) and Sunday 2026-07-05 12:00 (`weekday() == 6`), one day apart.
+
+- Listen on Saturday → `listening_streak == 1` (correct, first listen).
+- Listen on Sunday (the very next day) → `listening_streak` stayed at **1** instead of incrementing to **2**.
+
+This confirms the condition `elif days_since_last == 1 and today.weekday() != 6` in `services/streak_service.py` falls through to the `else` reset branch specifically when the *current* day is a Sunday, regardless of the day actually being consecutive. **Data condition needed:** `last_listened_at` one calendar day before `now`, and `now`'s weekday is Sunday. This matches the existing (already-failing) test `test_streak_increments_on_sunday`.
+
+### Issue #4 — Rating a song doesn't notify the sharer
+
+**How I reproduced it:** Started the app (`FLASK_APP=app:create_app flask run`) against freshly seeded data, and used two seeded users with a real sharer relationship: `nova` (id `489847de-...`) shared the song "Midnight Drive" (id `78d9724e-...`), and `darius` (id `ee08607c-...`) is her friend.
+
+1. `GET /users/<nova_id>/notifications` → baseline: 1 notification (the seeded "song added to playlist" one), count = 1.
+2. `POST /songs/<song_id>/rate` with `{"user_id": "<darius_id>", "score": 5}` → `201`, a `Rating` row is created successfully.
+3. `GET /users/<nova_id>/notifications` again → still count = 1, **no new notification appeared**.
+
+**Contrast:** the seeded notification with `notification_type: "song_added_to_playlist"` proves the notification pipeline itself works — `add_to_playlist()` calls `create_notification()`. The rating action goes through `rate_song()` in the same file, which never calls `create_notification()`. **Sequence needed:** any user other than the song's sharer submits a rating for that song — the sharer should get notified but doesn't.
+
+### Issue #5 — Last song in a playlist never shows up
+
+**How I reproduced it:** Using the seeded playlist "Late Night Vibes" (id `a8163c90-...`), queried the `playlist_entries` table directly to establish ground truth: 7 rows exist for this playlist, at positions 1 through 7.
+
+- `GET /playlists/<playlist_id>/songs` → returned `"count": 6`, containing songs at positions 1–6 only. The song at **position 7** ("Frequencies" by Static Era) was silently missing from the response, with no error.
+
+**Data condition needed:** any playlist with at least one song — `get_playlist_songs()` in `services/playlist_service.py` orders songs by position correctly but then returns `songs[:-1]`, unconditionally dropping the last element of the ordered list before serializing. This matches the existing (already-failing) tests `test_playlist_returns_all_songs` and `test_playlist_returns_songs_in_order`.
+
+### Notes
+
+- After reproduction, re-ran `python seed_data.py` to reset the dev DB to a clean seeded state before starting fix work, since the Issue #4 repro step wrote a real `Rating` row to `mixtape.db`.
+- No code changes were made in this milestone.
