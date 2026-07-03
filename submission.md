@@ -1,5 +1,7 @@
 # Mixtape — Submission
 
+`git log --oneline` on `bugfix/mixtape`, showing separate commits per bug fix: [screenshots/git-log.png](screenshots/git-log.png)
+
 ## AI Usage
 
 I used Claude Code (an AI coding agent) throughout this project, mostly for navigation and verification rather than for writing the fixes themselves — the actual fixes were one- or two-line changes once the root cause was located, so the value of AI here was in reading code faster and cross-checking hypotheses, not generating logic.
